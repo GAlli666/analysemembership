@@ -247,12 +247,12 @@ Connect-MgGraph
     # Cache for group memberships
     $groupMembershipCache = @{}
 
-    # Get members for all reference groups
-    Write-ColorOutput "Fetching members from reference groups..." -Color Yellow
+    # Prepare reference group metadata (don't load members yet - lazy load on demand)
+    Write-ColorOutput "Preparing reference group metadata..." -Color Yellow
     $referenceGroupData = @{}
 
     foreach ($refGroupId in $referenceGroupIds) {
-        Write-ColorOutput "  Processing reference group: $refGroupId" -Color Gray
+        Write-ColorOutput "  Loading reference group: $refGroupId" -Color Gray
 
         try {
             # Try to get group by ID first, then by display name
@@ -269,12 +269,12 @@ Connect-MgGraph
             }
 
             if ($group) {
-                $members = Get-EntraGroupMembers -GroupId $group.Id -Cache $groupMembershipCache
+                # Store only metadata, not members (lazy load later)
                 $referenceGroupData[$group.DisplayName] = @{
                     Id      = $group.Id
-                    Members = $members
+                    Members = $null  # Will be loaded on-demand
                 }
-                Write-ColorOutput "    Found $($members.Count) member(s) in '$($group.DisplayName)'" -Color Green
+                Write-ColorOutput "    Reference group ready: '$($group.DisplayName)'" -Color Green
             }
             else {
                 Write-ColorOutput "    WARNING: Group not found: $refGroupId" -Color Yellow
@@ -285,7 +285,7 @@ Connect-MgGraph
         }
     }
 
-    Write-ColorOutput "`nReference groups processed: $($referenceGroupData.Keys.Count)`n" -Color Green
+    Write-ColorOutput "`nReference groups ready: $($referenceGroupData.Keys.Count)`n" -Color Green
 
     # Analyze each team/site and prepare CSV data
     $csvData = @()
@@ -303,13 +303,25 @@ Connect-MgGraph
                 'Group ID'          = $teamSite.GroupId
                 'Status'            = 'NO MEMBERS FOUND OR ACCESS DENIED'
                 'Total Members'     = 0
-                'Reference Group'   = ''
+                'Reference Groups'  = ''
                 'Members'           = ''
             }
             continue
         }
 
         Write-ColorOutput "  Found $($siteMembers.Count) member(s)" -Color Green
+
+        # Lazy load reference group members only now (on-demand)
+        Write-ColorOutput "  Loading reference group members for comparison..." -Color Gray
+        foreach ($refGroupName in $referenceGroupData.Keys) {
+            if ($null -eq $referenceGroupData[$refGroupName].Members) {
+                $refGroupId = $referenceGroupData[$refGroupName].Id
+                Write-ColorOutput "    Loading members from: $refGroupName" -Color DarkGray
+                $members = Get-EntraGroupMembers -GroupId $refGroupId -Cache $groupMembershipCache
+                $referenceGroupData[$refGroupName].Members = $members
+                Write-ColorOutput "      Loaded $($members.Count) member(s)" -Color DarkGray
+            }
+        }
 
         # Categorize members by reference group
         $membersByRefGroup = @{}
@@ -347,7 +359,7 @@ Connect-MgGraph
                 'Group ID'          = $teamSite.GroupId
                 'Status'            = 'NO REFERENCE GROUP MATCH'
                 'Total Members'     = $siteMembers.Count
-                'Reference Group'   = 'None'
+                'Reference Groups'  = 'None'
                 'Members'           = $membersList
             }
         }
@@ -362,38 +374,49 @@ Connect-MgGraph
                 'Group ID'          = $teamSite.GroupId
                 'Status'            = 'SINGLE REFERENCE GROUP'
                 'Total Members'     = $siteMembers.Count
-                'Reference Group'   = $refGroupName
+                'Reference Groups'  = $refGroupName
                 'Members'           = $membersList
             }
         }
         else {
-            # Mixed membership - create a row for each reference group
+            # Mixed membership - create a single row with reference groups as delimited string
             Write-ColorOutput "  Status: MIXED MEMBERSHIP" -Color Magenta
 
+            # Build a string of all reference groups found
+            $refGroupsList = ($membersByRefGroup.Keys | Sort-Object) -join $MemberSeparator
+
+            # Add "Not in any reference group" if applicable
+            if ($membersNotInAnyRefGroup.Count -gt 0) {
+                $refGroupsList += $MemberSeparator + "Not in any reference group"
+            }
+
+            # Collect all unique members with their reference groups
+            $allMembersWithGroups = @()
+
+            # Add members from each reference group with group label
             foreach ($refGroupName in ($membersByRefGroup.Keys | Sort-Object)) {
                 $uniqueMembers = $membersByRefGroup[$refGroupName] | Sort-Object Id -Unique
-                $membersList = ($uniqueMembers | ForEach-Object { "$($_.DisplayName) ($($_.Email))" }) -join $MemberSeparator
-                $csvData += [PSCustomObject]@{
-                    'Site/Team Name'    = $teamSite.Name
-                    'Group ID'          = $teamSite.GroupId
-                    'Status'            = 'MIXED MEMBERSHIP'
-                    'Total Members'     = $siteMembers.Count
-                    'Reference Group'   = $refGroupName
-                    'Members'           = $membersList
+                foreach ($member in $uniqueMembers) {
+                    $allMembersWithGroups += "[${refGroupName}] $($member.DisplayName) ($($member.Email))"
                 }
             }
 
-            # Add a row for members not in any reference group
+            # Add members not in any reference group
             if ($membersNotInAnyRefGroup.Count -gt 0) {
-                $membersList = ($membersNotInAnyRefGroup | ForEach-Object { "$($_.DisplayName) ($($_.Email))" }) -join $MemberSeparator
-                $csvData += [PSCustomObject]@{
-                    'Site/Team Name'    = $teamSite.Name
-                    'Group ID'          = $teamSite.GroupId
-                    'Status'            = 'MIXED MEMBERSHIP'
-                    'Total Members'     = $siteMembers.Count
-                    'Reference Group'   = 'Not in any reference group'
-                    'Members'           = $membersList
+                foreach ($member in $membersNotInAnyRefGroup) {
+                    $allMembersWithGroups += "[Not in any reference group] $($member.DisplayName) ($($member.Email))"
                 }
+            }
+
+            $membersList = $allMembersWithGroups -join $MemberSeparator
+
+            $csvData += [PSCustomObject]@{
+                'Site/Team Name'    = $teamSite.Name
+                'Group ID'          = $teamSite.GroupId
+                'Status'            = 'MIXED MEMBERSHIP'
+                'Total Members'     = $siteMembers.Count
+                'Reference Groups'  = $refGroupsList
+                'Members'           = $membersList
             }
         }
     }
